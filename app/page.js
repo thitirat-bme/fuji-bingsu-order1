@@ -1,339 +1,455 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { supabase } from "../../lib/supabaseClient";
+import { use, useEffect, useState } from "react";
+import { supabase } from "../../../lib/supabaseClient";
 
-// created_at จาก Supabase เป็น timestamptz อยู่แล้ว แต่กันไว้ กรณีไม่มี timezone ให้ถือเป็น UTC
-function parseDate(value) {
-  if (!value) return new Date(NaN);
-  const s = String(value);
-  return /([zZ]|[+-]\d{2}(:?\d{2})?)$/.test(s) ? new Date(s) : new Date(s.replace(" ", "T") + "Z");
+const PRICE_ADULT = 289;
+const PRICE_CHILD = 145;
+const MAX_QTY_PER_ITEM = 5;
+const MAX_ITEMS_PER_ORDER = 10;
+
+function formatBaht(n) {
+  return n.toLocaleString("th-TH") + " บาท";
 }
 
-function minutesSince(value, now) {
-  const diff = Math.floor((now - parseDate(value).getTime()) / 60000);
-  return Number.isFinite(diff) ? Math.max(0, diff) : 0;
+function FullMessage({ title, text }) {
+  return (
+    <main className="od-full">
+      <style>{css}</style>
+      <h1>{title}</h1>
+      {text && <p>{text}</p>}
+    </main>
+  );
 }
 
-export default function GenerateQrPage() {
-  const [tableNumber, setTableNumber] = useState("");
-  const [adults, setAdults] = useState("");
-  const [children, setChildren] = useState("");
+export default function OrderPage({ params }) {
+  // Next.js เวอร์ชันล่าสุด: params เป็น Promise ต้อง unwrap ด้วย use() เสมอ
+  const { tableNumber } = use(params);
+  const table = Number(tableNumber);
 
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState("");
-  const [notice, setNotice] = useState("");
+  const [phase, setPhase] = useState("loading"); // loading | notOpen | ready | thanks | error
+  const [loadError, setLoadError] = useState("");
+  const [reloadKey, setReloadKey] = useState(0);
 
-  const [conflict, setConflict] = useState(null); // session เก่าที่ยังเปิดค้างอยู่
-  const [confirmOpen, setConfirmOpen] = useState(false);
-  const [closing, setClosing] = useState(false);
-  const [nowAtOpen, setNowAtOpen] = useState(Date.now());
+  const [session, setSession] = useState(null); // { id, adult_count, child_count }
+  const [categories, setCategories] = useState([]);
+  const [items, setItems] = useState([]);
+  const [activeCat, setActiveCat] = useState(null);
 
-  const [result, setResult] = useState(null); // { table, adults, children, url }
-  const [copied, setCopied] = useState(false);
+  const [cart, setCart] = useState([]); // [{ id, name, quantity }]
+  const [cartOpen, setCartOpen] = useState(false);
+  const [sending, setSending] = useState(false);
+  const [sendError, setSendError] = useState("");
+  const [sent, setSent] = useState(false);
+  const [hint, setHint] = useState("");
 
-  // กด Esc = ยกเลิกกล่องยืนยัน
+  const [billOpen, setBillOpen] = useState(false);
+  const [billing, setBilling] = useState(false);
+  const [billError, setBillError] = useState("");
+
+  // 1) เช็ค session ของโต๊ะ แล้วโหลดเมนู
   useEffect(() => {
-    if (!confirmOpen) return;
-    const onKey = (e) => {
-      if (e.key === "Escape" && !closing) setConfirmOpen(false);
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [confirmOpen, closing]);
+    let cancelled = false;
 
-  function onTableChange(value) {
-    setTableNumber(value);
-    // เปลี่ยนเลขโต๊ะแล้ว คำเตือนของโต๊ะเดิมไม่เกี่ยวข้องอีกต่อไป
-    setConflict(null);
-    setNotice("");
-    setError("");
-  }
+    async function load() {
+      setPhase("loading");
+      setLoadError("");
 
-  async function handleOpenTable(e) {
-    e.preventDefault();
-    if (loading) return;
-    setError("");
-    setNotice("");
-
-    const table = Number(tableNumber);
-    const adultCount = Number(adults === "" ? 0 : adults);
-    const childCount = Number(children === "" ? 0 : children);
-
-    if (!Number.isInteger(table) || table < 1) {
-      setError("กรุณากรอกเลขโต๊ะเป็นตัวเลขตั้งแต่ 1 ขึ้นไป");
-      return;
-    }
-    if (!Number.isInteger(adultCount) || adultCount < 0 || !Number.isInteger(childCount) || childCount < 0) {
-      setError("จำนวนผู้ใหญ่และเด็กต้องเป็นจำนวนเต็ม ไม่ติดลบ");
-      return;
-    }
-    if (adultCount + childCount < 1) {
-      setError("กรุณาระบุจำนวนลูกค้าอย่างน้อย 1 คน");
-      return;
-    }
-
-    setLoading(true);
-    try {
-      // 1) เช็คว่าโต๊ะนี้มี session ที่ยังเปิดอยู่หรือไม่
-      const { data: existing, error: checkError } = await supabase
-        .from("sessions")
-        .select("id, adult_count, child_count, created_at")
-        .eq("table_number", table)
-        .eq("status", "open")
-        .order("created_at", { ascending: false })
-        .limit(1);
-
-      if (checkError) throw checkError;
-
-      if (existing && existing.length > 0) {
-        setConflict({ ...existing[0], table_number: table });
+      if (!Number.isInteger(table) || table < 1) {
+        setPhase("notOpen");
         return;
       }
 
-      // 2) ไม่มี → สร้าง session ใหม่
-      const { error: insertError } = await supabase.from("sessions").insert({
-        table_number: table,
-        adult_count: adultCount,
-        child_count: childCount,
-        status: "open",
-      });
+      try {
+        const { data: sessions, error: sessionError } = await supabase
+          .from("sessions")
+          .select("id, adult_count, child_count")
+          .eq("table_number", table)
+          .eq("status", "open")
+          .order("created_at", { ascending: false })
+          .limit(1);
 
+        if (sessionError) throw sessionError;
+        if (cancelled) return;
+
+        if (!sessions || sessions.length === 0) {
+          setPhase("notOpen");
+          return;
+        }
+
+        const [catRes, itemRes] = await Promise.all([
+          supabase.from("menu_categories").select("id, name, sort_order").order("sort_order", { ascending: true }),
+          supabase.from("menu_items").select("id, category_id, name").order("id", { ascending: true }),
+        ]);
+
+        if (catRes.error) throw catRes.error;
+        if (itemRes.error) throw itemRes.error;
+        if (cancelled) return;
+
+        setSession(sessions[0]);
+        setCategories(catRes.data || []);
+        setItems(itemRes.data || []);
+        setActiveCat((catRes.data && catRes.data[0] && catRes.data[0].id) ?? null);
+        setPhase("ready");
+      } catch (err) {
+        if (cancelled) return;
+        setLoadError(err?.message || "ไม่ทราบสาเหตุ");
+        setPhase("error");
+      }
+    }
+
+    load();
+    return () => {
+      cancelled = true;
+    };
+  }, [table, reloadKey]);
+
+  // ข้อความ "ส่งออเดอร์แล้ว" ค้างไว้สักครู่แล้วหายเอง
+  useEffect(() => {
+    if (!sent) return;
+    const t = setTimeout(() => setSent(false), 4000);
+    return () => clearTimeout(t);
+  }, [sent]);
+
+  useEffect(() => {
+    if (!hint) return;
+    const t = setTimeout(() => setHint(""), 2500);
+    return () => clearTimeout(t);
+  }, [hint]);
+
+  // กด Esc ปิดหน้าต่างยืนยัน
+  useEffect(() => {
+    if (!billOpen) return;
+    const onKey = (e) => {
+      if (e.key === "Escape" && !billing) setBillOpen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [billOpen, billing]);
+
+  const qtyOf = (id) => cart.find((c) => c.id === id)?.quantity ?? 0;
+
+  function addItem(item) {
+    const existing = cart.find((c) => c.id === item.id);
+    if (existing) {
+      if (existing.quantity >= MAX_QTY_PER_ITEM) {
+        setHint(`สั่งได้สูงสุด ${MAX_QTY_PER_ITEM} ชิ้นต่อรายการ`);
+        return;
+      }
+      setCart(cart.map((c) => (c.id === item.id ? { ...c, quantity: c.quantity + 1 } : c)));
+    } else {
+      if (cart.length >= MAX_ITEMS_PER_ORDER) {
+        setHint(`เลือกได้สูงสุด ${MAX_ITEMS_PER_ORDER} รายการต่อการส่ง 1 ครั้ง`);
+        return;
+      }
+      setCart([...cart, { id: item.id, name: item.name, quantity: 1 }]);
+    }
+    setSendError("");
+  }
+
+  function decItem(id) {
+    setCart(
+      cart
+        .map((c) => (c.id === id ? { ...c, quantity: c.quantity - 1 } : c))
+        .filter((c) => c.quantity > 0)
+    );
+  }
+
+  function removeItem(id) {
+    setCart(cart.filter((c) => c.id !== id));
+  }
+
+  async function submitOrder() {
+    if (sending || cart.length === 0 || !session) return;
+    setSending(true);
+    setSendError("");
+    try {
+      // กันกรณีพนักงานปิดโต๊ะไปแล้วระหว่างที่ลูกค้าเลือกเมนู
+      const { data: stillOpen, error: checkError } = await supabase
+        .from("sessions")
+        .select("id")
+        .eq("id", session.id)
+        .eq("status", "open")
+        .limit(1);
+      if (checkError) throw checkError;
+      if (!stillOpen || stillOpen.length === 0) {
+        setPhase("notOpen");
+        return;
+      }
+
+      const { error: insertError } = await supabase.from("orders").insert({
+        session_id: session.id,
+        table_number: table,
+        items: cart.map(({ name, quantity }) => ({ name, quantity })),
+        status: "received",
+      });
       if (insertError) throw insertError;
 
-      setResult({
-        table,
-        adults: adultCount,
-        children: childCount,
-        url: `${window.location.origin}/order/${table}`,
-      });
-      setCopied(false);
+      setCart([]);
+      setCartOpen(false);
+      setSent(true);
     } catch (err) {
-      setError("เกิดข้อผิดพลาด: " + (err?.message || "ไม่ทราบสาเหตุ") + " — กรุณาลองใหม่อีกครั้ง");
+      setSendError("ส่งออเดอร์ไม่สำเร็จ: " + (err?.message || "ไม่ทราบสาเหตุ") + " — กรุณาลองใหม่อีกครั้ง");
     } finally {
-      setLoading(false);
+      setSending(false);
     }
   }
 
-  function askCloseOld() {
-    setNowAtOpen(Date.now());
-    setConfirmOpen(true);
-  }
-
-  async function confirmCloseOld() {
-    if (!conflict || closing) return;
-    setClosing(true);
-    setError("");
+  async function confirmBill() {
+    if (billing || !session) return;
+    setBilling(true);
+    setBillError("");
     try {
-      // เช็ค status = 'open' ซ้ำตอน update กันการกดซ้ำซ้อน
-      const { data, error: updateError } = await supabase
+      const { error: updateError } = await supabase
         .from("sessions")
         .update({ status: "closed" })
-        .eq("id", conflict.id)
-        .eq("status", "open")
-        .select("id");
-
+        .eq("id", session.id)
+        .eq("status", "open");
       if (updateError) throw updateError;
 
-      const alreadyClosed = !data || data.length === 0;
-      setConfirmOpen(false);
-      setConflict(null);
-      setNotice(
-        alreadyClosed
-          ? "โต๊ะนี้ถูกปิดไปแล้ว กด “เปิดโต๊ะ” เพื่อเปิดใหม่"
-          : "ปิดโต๊ะเดิมเรียบร้อย กด “เปิดโต๊ะ” อีกครั้งเพื่อเปิดใหม่"
-      );
+      setBillOpen(false);
+      setPhase("thanks");
     } catch (err) {
-      setConfirmOpen(false);
-      setError("ปิดโต๊ะเดิมไม่สำเร็จ: " + (err?.message || "ไม่ทราบสาเหตุ") + " — กรุณาลองใหม่อีกครั้ง");
+      setBillError("เรียกเก็บเงินไม่สำเร็จ: " + (err?.message || "ไม่ทราบสาเหตุ") + " — กรุณาลองใหม่อีกครั้ง");
     } finally {
-      setClosing(false);
+      setBilling(false);
     }
   }
 
-  async function copyLink() {
-    if (!result) return;
-    try {
-      await navigator.clipboard.writeText(result.url);
-    } catch {
-      // fallback สำหรับเบราว์เซอร์ที่ไม่รองรับ clipboard API
-      const ta = document.createElement("textarea");
-      ta.value = result.url;
-      document.body.appendChild(ta);
-      ta.select();
-      document.execCommand("copy");
-      document.body.removeChild(ta);
-    }
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
+  if (phase === "loading") {
+    return <FullMessage title="กำลังโหลดเมนู..." />;
+  }
+  if (phase === "notOpen") {
+    return <FullMessage title="โต๊ะนี้ยังไม่เปิดใช้งาน กรุณาแจ้งพนักงาน" />;
+  }
+  if (phase === "thanks") {
+    return <FullMessage title="ขอบคุณที่ใช้บริการ" />;
+  }
+  if (phase === "error") {
+    return (
+      <main className="od-full">
+        <style>{css}</style>
+        <h1>โหลดข้อมูลไม่สำเร็จ</h1>
+        <p>{loadError}</p>
+        <button type="button" className="od-btn od-btn-primary" onClick={() => setReloadKey((k) => k + 1)}>
+          ลองอีกครั้ง
+        </button>
+      </main>
+    );
   }
 
-  function resetForm() {
-    setResult(null);
-    setTableNumber("");
-    setAdults("");
-    setChildren("");
-    setConflict(null);
-    setNotice("");
-    setError("");
-    setCopied(false);
-  }
-
-  const qrSrc = result
-    ? `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(result.url)}`
-    : "";
+  const total = session.adult_count * PRICE_ADULT + session.child_count * PRICE_CHILD;
+  const visibleItems = items.filter((i) => i.category_id === activeCat);
+  const totalPieces = cart.reduce((sum, c) => sum + c.quantity, 0);
 
   return (
-    <main className="gq">
+    <div className="od">
       <style>{css}</style>
 
-      <h1 className="gq-title">เปิดโต๊ะ</h1>
-
-      {result ? (
-        <section className="gq-card gq-result" aria-live="polite">
-          {/* eslint-disable-next-line @next/next/no-img-element */}
-          <img
-            className="gq-qr"
-            src={qrSrc}
-            width={300}
-            height={300}
-            alt={`QR Code สำหรับสั่งอาหารโต๊ะ ${result.table}`}
-          />
-          <p className="gq-summary">
-            โต๊ะ {result.table} · ผู้ใหญ่ {result.adults} · เด็ก {result.children}
-          </p>
-          <div className="gq-linkrow">
-            <span className="gq-link">{result.url}</span>
-            <button type="button" className="gq-btn gq-btn-small" onClick={copyLink}>
-              {copied ? "คัดลอกแล้ว" : "คัดลอกลิงก์"}
-            </button>
+      <header className="od-header">
+        <div className="od-header-top">
+          <div>
+            <div className="od-shop">บิงซูภูเขาฟูจิ</div>
+            <div className="od-table">โต๊ะ {table}</div>
           </div>
-          <button type="button" className="gq-btn gq-btn-primary" onClick={resetForm}>
-            เปิดโต๊ะใหม่
+          <button
+            type="button"
+            className="od-btn od-btn-bill"
+            onClick={() => {
+              setBillError("");
+              setBillOpen(true);
+            }}
+          >
+            เรียกเก็บเงิน
           </button>
-        </section>
-      ) : (
-        <form className="gq-card" onSubmit={handleOpenTable} noValidate>
-          <label className="gq-field">
-            <span>เลขโต๊ะ</span>
-            <input
-              type="number"
-              inputMode="numeric"
-              min="1"
-              value={tableNumber}
-              onChange={(e) => onTableChange(e.target.value)}
-              placeholder="เช่น 7"
-              autoFocus
-            />
-          </label>
+        </div>
 
-          <label className="gq-field">
-            <span>จำนวนผู้ใหญ่</span>
-            <input
-              type="number"
-              inputMode="numeric"
-              min="0"
-              value={adults}
-              onChange={(e) => setAdults(e.target.value)}
-              placeholder="0"
-            />
-          </label>
+        <div className="od-tabs" role="tablist" aria-label="หมวดหมู่เมนู">
+          {categories.map((cat) => (
+            <button
+              key={cat.id}
+              type="button"
+              role="tab"
+              aria-selected={cat.id === activeCat}
+              className={"od-tab" + (cat.id === activeCat ? " od-tab-active" : "")}
+              onClick={() => setActiveCat(cat.id)}
+            >
+              {cat.name}
+            </button>
+          ))}
+        </div>
+      </header>
 
-          <label className="gq-field">
-            <span>จำนวนเด็ก</span>
-            <input
-              type="number"
-              inputMode="numeric"
-              min="0"
-              value={children}
-              onChange={(e) => setChildren(e.target.value)}
-              placeholder="0"
-            />
-          </label>
-
-          {notice && (
-            <p className="gq-notice" role="status">
-              {notice}
-            </p>
-          )}
-          {error && (
-            <p className="gq-error" role="alert">
-              {error}
-            </p>
-          )}
-
-          {conflict && (
-            <div className="gq-warning" role="alert">
-              <p>โต๊ะนี้มีลูกค้าอยู่ระหว่างทานอาหาร กรุณาปิดออเดอร์เดิมก่อน</p>
-              <button type="button" className="gq-btn gq-btn-danger" onClick={askCloseOld}>
-                ปิดออเดอร์เดิม
-              </button>
-            </div>
-          )}
-
-          <button type="submit" className="gq-btn gq-btn-primary" disabled={loading}>
-            {loading ? "กำลังตรวจสอบ..." : "เปิดโต๊ะ"}
-          </button>
-        </form>
+      {sent && (
+        <div className="od-sent" role="status">
+          ส่งออเดอร์แล้ว
+        </div>
       )}
 
-      {confirmOpen && conflict && (
-        <div className="gq-overlay">
-          <div className="gq-dialog" role="dialog" aria-modal="true" aria-labelledby="gq-dialog-title">
-            <h2 id="gq-dialog-title">ยืนยันปิดโต๊ะเดิม?</h2>
+      <main className="od-list" role="tabpanel">
+        {visibleItems.length === 0 && <p className="od-empty">ยังไม่มีเมนูในหมวดนี้</p>}
+        {visibleItems.map((item) => {
+          const q = qtyOf(item.id);
+          return (
+            <div key={item.id} className="od-item">
+              <span className="od-item-name">{item.name}</span>
+              {q === 0 ? (
+                <button type="button" className="od-round od-round-add" onClick={() => addItem(item)} aria-label={`เพิ่ม ${item.name}`}>
+                  +
+                </button>
+              ) : (
+                <div className="od-stepper">
+                  <button type="button" className="od-round" onClick={() => decItem(item.id)} aria-label={`ลด ${item.name}`}>
+                    −
+                  </button>
+                  <span className="od-qty" aria-live="polite">
+                    {q}
+                  </span>
+                  <button type="button" className="od-round od-round-add" onClick={() => addItem(item)} aria-label={`เพิ่ม ${item.name}`}>
+                    +
+                  </button>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </main>
+
+      {hint && (
+        <div className="od-hint" role="status">
+          {hint}
+        </div>
+      )}
+
+      {cart.length > 0 && (
+        <div className="od-cartbar">
+          {cartOpen && (
+            <div className="od-cartlist">
+              {cart.map((c) => (
+                <div key={c.id} className="od-cartline">
+                  <span className="od-cartline-name">{c.name}</span>
+                  <div className="od-stepper">
+                    <button type="button" className="od-round od-round-sm" onClick={() => decItem(c.id)} aria-label={`ลด ${c.name}`}>
+                      −
+                    </button>
+                    <span className="od-qty">{c.quantity}</span>
+                    <button type="button" className="od-round od-round-sm od-round-add" onClick={() => addItem(c)} aria-label={`เพิ่ม ${c.name}`}>
+                      +
+                    </button>
+                  </div>
+                  <button type="button" className="od-remove" onClick={() => removeItem(c.id)}>
+                    ลบ
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+          {sendError && (
+            <p className="od-error" role="alert">
+              {sendError}
+            </p>
+          )}
+          <div className="od-cartrow">
+            <button type="button" className="od-cartsummary" onClick={() => setCartOpen(!cartOpen)} aria-expanded={cartOpen}>
+              <span className="od-badge">{cart.length}</span>
+              <span>
+                ตะกร้า ({cart.length}/{MAX_ITEMS_PER_ORDER} รายการ · {totalPieces} ชิ้น)
+              </span>
+            </button>
+            <button type="button" className="od-btn od-btn-primary od-send" onClick={submitOrder} disabled={sending}>
+              {sending ? "กำลังส่ง..." : "ส่งออเดอร์"}
+            </button>
+          </div>
+        </div>
+      )}
+
+      {billOpen && (
+        <div className="od-overlay">
+          <div className="od-dialog" role="dialog" aria-modal="true" aria-labelledby="od-bill-title">
+            <h2 id="od-bill-title">เรียกเก็บเงิน</h2>
             <ul>
-              <li>โต๊ะ {conflict.table_number}</li>
               <li>
-                ผู้ใหญ่ {conflict.adult_count} · เด็ก {conflict.child_count}
+                ผู้ใหญ่ {session.adult_count} × {PRICE_ADULT} = {formatBaht(session.adult_count * PRICE_ADULT)}
               </li>
-              <li>เปิดมาแล้ว {minutesSince(conflict.created_at, nowAtOpen)} นาที</li>
+              <li>
+                เด็ก {session.child_count} × {PRICE_CHILD} = {formatBaht(session.child_count * PRICE_CHILD)}
+              </li>
             </ul>
-            <div className="gq-dialog-actions">
-              <button
-                type="button"
-                className="gq-btn"
-                onClick={() => setConfirmOpen(false)}
-                disabled={closing}
-                autoFocus
-              >
+            <p className="od-total">ยอดที่ต้องจ่าย {formatBaht(total)}</p>
+            {cart.length > 0 && <p className="od-warn">มีรายการในตะกร้าที่ยังไม่ได้ส่ง หากเรียกเก็บเงินจะไม่ถูกส่งไปที่ครัว</p>}
+            {billError && (
+              <p className="od-error" role="alert">
+                {billError}
+              </p>
+            )}
+            <div className="od-dialog-actions">
+              <button type="button" className="od-btn" onClick={() => setBillOpen(false)} disabled={billing} autoFocus>
                 ยกเลิก
               </button>
-              <button type="button" className="gq-btn gq-btn-danger" onClick={confirmCloseOld} disabled={closing}>
-                {closing ? "กำลังปิด..." : "ยืนยันปิดโต๊ะเดิม"}
+              <button type="button" className="od-btn od-btn-primary" onClick={confirmBill} disabled={billing}>
+                {billing ? "กำลังดำเนินการ..." : "ยืนยันเรียกเก็บเงิน"}
               </button>
             </div>
           </div>
         </div>
       )}
-    </main>
+    </div>
   );
 }
 
 const css = `
-.gq { max-width: 520px; margin: 0 auto; padding: 1.5rem 1rem 3rem; font-size: 1.25rem; }
-.gq-title { font-size: 2rem; margin: 0 0 1rem; color: var(--fuji); }
-.gq-card { display: flex; flex-direction: column; gap: 1.1rem; background: #fff; border: 2px solid #d9e0ee; border-radius: 16px; padding: 1.25rem; }
-.gq-field { display: flex; flex-direction: column; gap: 0.35rem; font-weight: 600; }
-.gq-field input { font: inherit; font-size: 1.6rem; padding: 0.6rem 0.8rem; border: 2px solid #b8c3da; border-radius: 12px; width: 100%; }
-.gq-field input:focus-visible { outline: 3px solid var(--fuji); outline-offset: 1px; }
-.gq-btn { font: inherit; font-weight: 700; padding: 0.85rem 1.25rem; border-radius: 12px; border: 2px solid #b8c3da; background: #fff; color: var(--ink); cursor: pointer; }
-.gq-btn:focus-visible { outline: 3px solid var(--fuji); outline-offset: 2px; }
-.gq-btn:disabled { opacity: 0.6; cursor: not-allowed; }
-.gq-btn-primary { background: var(--fuji); border-color: var(--fuji); color: #fff; font-size: 1.4rem; padding: 1rem; }
-.gq-btn-danger { background: #c62828; border-color: #c62828; color: #fff; }
-.gq-btn-small { font-size: 1rem; padding: 0.45rem 0.8rem; white-space: nowrap; }
-.gq-warning { background: #fff3e0; border: 3px solid #e65100; border-radius: 14px; padding: 1rem; display: flex; flex-direction: column; gap: 0.75rem; color: #7a2e00; font-weight: 700; }
-.gq-warning p { margin: 0; }
-.gq-error { margin: 0; background: #fdecea; border: 2px solid #c62828; color: #8e1b1b; border-radius: 12px; padding: 0.75rem 1rem; font-weight: 600; }
-.gq-notice { margin: 0; background: #e8f5e9; border: 2px solid #2e7d32; color: #1b5e20; border-radius: 12px; padding: 0.75rem 1rem; font-weight: 600; }
-.gq-result { align-items: center; text-align: center; }
-.gq-qr { width: 100%; max-width: 300px; height: auto; border: 1px solid #d9e0ee; border-radius: 8px; }
-.gq-summary { margin: 0; font-size: 1.6rem; font-weight: 700; }
-.gq-linkrow { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 0.6rem; }
-.gq-link { font-size: 1.05rem; word-break: break-all; color: var(--fuji); font-weight: 600; }
-.gq-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.55); display: flex; align-items: center; justify-content: center; padding: 1rem; z-index: 50; }
-.gq-dialog { background: #fff; border: 4px solid #c62828; border-radius: 16px; padding: 1.5rem; width: 100%; max-width: 440px; }
-.gq-dialog h2 { margin: 0 0 0.75rem; color: #c62828; font-size: 1.6rem; }
-.gq-dialog ul { list-style: none; margin: 0 0 1.25rem; padding: 0; font-size: 1.3rem; font-weight: 600; display: flex; flex-direction: column; gap: 0.3rem; }
-.gq-dialog-actions { display: flex; flex-wrap: wrap; gap: 0.75rem; justify-content: flex-end; }
+.od { min-height: 100vh; padding-bottom: 9rem; font-size: 1.15rem; }
+.od-full { min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 1rem; padding: 2rem 1.5rem; text-align: center; }
+.od-full h1 { margin: 0; font-size: 1.9rem; line-height: 1.4; color: var(--fuji); }
+.od-full p { margin: 0; color: var(--muted); }
+
+.od-header { position: sticky; top: 0; z-index: 20; background: var(--snow); border-bottom: 2px solid #d9e0ee; }
+.od-header-top { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; padding: 0.75rem 1rem 0.5rem; }
+.od-shop { font-size: 1.35rem; font-weight: 700; color: var(--fuji); line-height: 1.2; }
+.od-table { font-size: 1rem; color: var(--muted); }
+
+.od-tabs { display: flex; gap: 0.5rem; overflow-x: auto; padding: 0.25rem 1rem 0.75rem; scrollbar-width: none; }
+.od-tabs::-webkit-scrollbar { display: none; }
+.od-tab { flex: 0 0 auto; font: inherit; font-weight: 600; padding: 0.6rem 1.1rem; min-height: 48px; border-radius: 999px; border: 2px solid #b8c3da; background: #fff; color: var(--ink); cursor: pointer; white-space: nowrap; }
+.od-tab-active { background: var(--fuji); border-color: var(--fuji); color: #fff; }
+.od-tab:focus-visible, .od-btn:focus-visible, .od-round:focus-visible, .od-cartsummary:focus-visible, .od-remove:focus-visible { outline: 3px solid var(--fuji); outline-offset: 2px; }
+
+.od-list { padding: 0.75rem 1rem; display: flex; flex-direction: column; gap: 0.6rem; }
+.od-empty { text-align: center; color: var(--muted); margin-top: 2rem; }
+.od-item { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; background: #fff; border: 2px solid #e1e7f2; border-radius: 16px; padding: 0.75rem 0.9rem; }
+.od-item-name { font-size: 1.2rem; font-weight: 600; line-height: 1.4; }
+
+.od-stepper { display: flex; align-items: center; gap: 0.5rem; flex: 0 0 auto; }
+.od-qty { min-width: 1.6rem; text-align: center; font-size: 1.3rem; font-weight: 700; }
+.od-round { font: inherit; font-size: 1.6rem; font-weight: 700; line-height: 1; width: 52px; height: 52px; border-radius: 50%; border: 2px solid #b8c3da; background: #fff; color: var(--ink); cursor: pointer; display: inline-flex; align-items: center; justify-content: center; }
+.od-round-add { background: var(--sakura-soft); border-color: var(--sakura); color: #8a2f4b; }
+.od-round-sm { width: 44px; height: 44px; font-size: 1.4rem; }
+
+.od-btn { font: inherit; font-weight: 700; min-height: 52px; padding: 0.7rem 1.2rem; border-radius: 14px; border: 2px solid #b8c3da; background: #fff; color: var(--ink); cursor: pointer; }
+.od-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+.od-btn-primary { background: var(--fuji); border-color: var(--fuji); color: #fff; }
+.od-btn-bill { min-height: 48px; padding: 0.5rem 1rem; font-size: 1rem; border-color: var(--sakura); background: var(--sakura-soft); color: #8a2f4b; }
+
+.od-sent { position: fixed; top: 5.5rem; left: 50%; transform: translateX(-50%); z-index: 30; background: #2e7d32; color: #fff; font-weight: 700; padding: 0.75rem 1.5rem; border-radius: 999px; box-shadow: 0 4px 14px rgba(0,0,0,0.2); }
+.od-hint { position: fixed; left: 50%; bottom: 6.5rem; transform: translateX(-50%); z-index: 30; max-width: calc(100% - 2rem); background: #1d2b45; color: #fff; font-size: 1rem; padding: 0.6rem 1rem; border-radius: 12px; text-align: center; }
+
+.od-cartbar { position: fixed; left: 0; right: 0; bottom: 0; z-index: 25; background: #fff; border-top: 2px solid #d9e0ee; padding: 0.6rem 1rem calc(0.75rem + env(safe-area-inset-bottom, 0px)); box-shadow: 0 -4px 14px rgba(0,0,0,0.08); }
+.od-cartlist { max-height: 40vh; overflow-y: auto; display: flex; flex-direction: column; gap: 0.4rem; padding-bottom: 0.6rem; }
+.od-cartline { display: flex; align-items: center; gap: 0.6rem; }
+.od-cartline-name { flex: 1 1 auto; font-weight: 600; line-height: 1.3; }
+.od-remove { font: inherit; font-size: 0.95rem; min-height: 44px; padding: 0 0.6rem; border: none; background: none; color: #c62828; font-weight: 700; cursor: pointer; }
+.od-cartrow { display: flex; align-items: center; gap: 0.75rem; }
+.od-cartsummary { font: inherit; font-weight: 600; flex: 1 1 auto; min-height: 52px; display: flex; align-items: center; gap: 0.6rem; text-align: left; background: none; border: none; color: var(--ink); cursor: pointer; padding: 0; }
+.od-badge { flex: 0 0 auto; min-width: 2rem; height: 2rem; padding: 0 0.4rem; border-radius: 999px; background: var(--sakura); color: #fff; display: inline-flex; align-items: center; justify-content: center; font-weight: 700; }
+.od-send { flex: 0 0 auto; }
+
+.od-error { margin: 0 0 0.5rem; background: #fdecea; border: 2px solid #c62828; color: #8e1b1b; border-radius: 12px; padding: 0.6rem 0.9rem; font-weight: 600; font-size: 1rem; }
+.od-warn { margin: 0; background: #fff3e0; border: 2px solid #e65100; color: #7a2e00; border-radius: 12px; padding: 0.6rem 0.9rem; font-weight: 600; font-size: 1rem; }
+
+.od-overlay { position: fixed; inset: 0; z-index: 50; background: rgba(0,0,0,0.55); display: flex; align-items: center; justify-content: center; padding: 1rem; }
+.od-dialog { width: 100%; max-width: 440px; background: #fff; border-radius: 18px; padding: 1.5rem; display: flex; flex-direction: column; gap: 0.9rem; }
+.od-dialog h2 { margin: 0; color: var(--fuji); font-size: 1.6rem; }
+.od-dialog ul { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.3rem; font-size: 1.15rem; }
+.od-total { margin: 0; font-size: 1.6rem; font-weight: 700; }
+.od-dialog-actions { display: flex; flex-wrap: wrap; gap: 0.75rem; justify-content: flex-end; }
 `;
